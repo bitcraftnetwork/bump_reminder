@@ -14,12 +14,14 @@ const client = new Client({
 
 // Initialize Express server for Render keep-alive
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // In-memory storage for bump tracking
 let bumpData = {
     lastBumpTime: null,
-    cooldownTimeout: null
+    cooldownTimeout: null,
+    reminderSent: false,
+    lastBumpMessageId: null
 };
 
 // Configuration from environment variables
@@ -31,79 +33,184 @@ const BUMP_ROLE_ID = process.env.BUMP_ROLE_ID;
 const COOLDOWN_DURATION = 120 * 60 * 1000;
 
 // Bot ready event
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`✅ Bot is online as ${client.user.tag}`);
     console.log(`📡 Monitoring channel: ${BUMP_CHANNEL_ID}`);
     console.log(`🔔 Will mention role: ${BUMP_ROLE_ID}`);
+    
+    // Check for recent bumps on startup
+    await checkForRecentBumps();
 });
+
+// Check for recent bumps on startup
+async function checkForRecentBumps() {
+    try {
+        const channel = client.channels.cache.get(BUMP_CHANNEL_ID);
+        if (!channel) {
+            console.log('❌ Could not find bump channel');
+            return;
+        }
+
+        console.log('🔍 Checking for recent bump messages...');
+        
+        // Fetch recent messages (last 50 messages should be enough)
+        const messages = await channel.messages.fetch({ limit: 50 });
+        
+        // Known bump bot IDs
+        const knownBumpBots = [
+            '302050872383242240', // Disboard
+            '716390085896962058', // ServerHype
+            '450100127256936458', // Bump.cc
+            '1382299188095746088', // Your bump bot
+        ];
+        
+        // Common bump bot patterns
+        const bumpBotPatterns = [
+            /bump done|bumped|bump successful/i,
+            /server bumped/i,
+            /bump complete/i,
+            /successfully bumped/i,
+        ];
+        
+        let latestBumpMessage = null;
+        
+        // Look for the most recent bump message
+        for (const message of messages.values()) {
+            if (message.author.bot && knownBumpBots.includes(message.author.id)) {
+                let isBumpMessage = false;
+                
+                // Check message content
+                if (message.content && bumpBotPatterns.some(pattern => pattern.test(message.content))) {
+                    isBumpMessage = true;
+                }
+                
+                // Check embeds
+                if (message.embeds && message.embeds.length > 0) {
+                    for (const embed of message.embeds) {
+                        if ((embed.title && bumpBotPatterns.some(pattern => pattern.test(embed.title))) ||
+                            (embed.description && bumpBotPatterns.some(pattern => pattern.test(embed.description)))) {
+                            isBumpMessage = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if (isBumpMessage) {
+                    latestBumpMessage = message;
+                    break; // Messages are in chronological order (newest first)
+                }
+            }
+        }
+        
+        if (latestBumpMessage) {
+            const bumpTime = latestBumpMessage.createdTimestamp;
+            const timeElapsed = Date.now() - bumpTime;
+            const timeRemaining = COOLDOWN_DURATION - timeElapsed;
+            
+            console.log(`📅 Found recent bump from ${latestBumpMessage.author.tag} at ${new Date(bumpTime).toISOString()}`);
+            console.log(`⏱️ Time elapsed: ${Math.floor(timeElapsed / 60000)} minutes`);
+            
+            if (timeRemaining > 0) {
+                // Still in cooldown period
+                console.log(`⏰ Cooldown active: ${Math.floor(timeRemaining / 60000)} minutes remaining`);
+                
+                bumpData.lastBumpTime = bumpTime;
+                bumpData.lastBumpMessageId = latestBumpMessage.id;
+                bumpData.reminderSent = false; // Haven't sent reminder for this bump yet
+                bumpData.cooldownTimeout = setTimeout(async () => {
+                    await sendBumpReminder(channel);
+                }, timeRemaining);
+                
+                // Send startup notification
+                const startupEmbed = new EmbedBuilder()
+                    .setColor('#FFA500')
+                    .setTitle('🔄 Bot Restarted - Cooldown Resumed')
+                    .setDescription('Found recent bump and resumed cooldown tracking.')
+                    .addFields(
+                        { name: '⏰ Next Bump Available', value: `<t:${Math.floor((bumpTime + COOLDOWN_DURATION) / 1000)}:R>`, inline: true },
+                        { name: '🤖 Last Bump By', value: `${latestBumpMessage.author.tag}`, inline: true }
+                    )
+                    .setTimestamp()
+                    .setFooter({ text: 'Cooldown resumed from previous session' });
+                
+                await channel.send({ embeds: [startupEmbed] });
+                
+            } else {
+                // Cooldown has already expired - send reminder only if not sent before
+                console.log('✅ Previous bump cooldown has expired');
+                
+                // Check if we already sent a reminder for this bump by looking for recent reminder messages
+                const recentMessages = await channel.messages.fetch({ limit: 10 });
+                const hasRecentReminder = recentMessages.some(msg => 
+                    msg.author.id === client.user.id && 
+                    msg.embeds.some(embed => embed.title && embed.title.includes('Bump Reminder')) &&
+                    (Date.now() - msg.createdTimestamp) < (COOLDOWN_DURATION + 300000) // Within 125 minutes of bump
+                );
+                
+                if (!hasRecentReminder) {
+                    await sendBumpReminder(channel);
+                } else {
+                    console.log('⚠️ Reminder already sent for expired cooldown, waiting for new bump');
+                    bumpData.reminderSent = true;
+                }
+            }
+        } else {
+            console.log('🆕 No recent bump messages found - waiting for new bump');
+        }
+        
+    } catch (error) {
+        console.error('Error checking for recent bumps:', error);
+    }
+}
 
 // Message event listener
 client.on('messageCreate', async (message) => {
-    // Ignore bot messages
-    if (message.author.bot) return;
-    
     // Only process messages in the designated bump channel
     if (message.channel.id !== BUMP_CHANNEL_ID) return;
 
-    // Handle bot commands
-    if (message.content.startsWith('!')) {
+    // Handle user commands (non-bot messages)
+    if (!message.author.bot && message.content.startsWith('!')) {
         await handleBotCommands(message);
+        return;
+    }
+
+    // Detect bump bot responses (bot messages)
+    if (message.author.bot) {
+        await detectBumpBotResponse(message);
         return;
     }
 });
 
-// Interaction event listener for slash commands
+// Interaction event listener for slash commands (backup detection)
 client.on('interactionCreate', async (interaction) => {
     // Only process slash commands in the designated bump channel
     if (interaction.channel.id !== BUMP_CHANNEL_ID) return;
     
-    // Check if it's the /bump command
+    // Check if it's the /bump command (backup detection)
     if (interaction.isCommand() && interaction.commandName === 'bump') {
         await handleBumpCommand(interaction);
     }
 });
 
-// Handle /bump command
+// Handle /bump command (backup detection)
 async function handleBumpCommand(interaction) {
     try {
-        console.log(`🚀 /bump command detected by ${interaction.user.tag}`);
-        
-        // Record the bump time
-        bumpData.lastBumpTime = Date.now();
-        
-        // Clear any existing timeout
-        if (bumpData.cooldownTimeout) {
-            clearTimeout(bumpData.cooldownTimeout);
-        }
-        
-        // Set up new cooldown timer
-        bumpData.cooldownTimeout = setTimeout(async () => {
-            await sendBumpReminder(interaction.channel);
-        }, COOLDOWN_DURATION);
-        
-        // Send confirmation embed
-        const confirmEmbed = new EmbedBuilder()
-            .setColor('#00FF00')
-            .setTitle('✅ Bump Detected!')
-            .setDescription('Server has been bumped successfully!')
-            .addFields(
-                { name: '⏰ Next Bump Available', value: `<t:${Math.floor((Date.now() + COOLDOWN_DURATION) / 1000)}:R>`, inline: true },
-                { name: '👤 Bumped By', value: `${interaction.user}`, inline: true }
-            )
-            .setTimestamp()
-            .setFooter({ text: 'Bump Cooldown Tracker' });
-        
-        // Send confirmation message
-        await interaction.channel.send({ embeds: [confirmEmbed] });
-        
+        console.log(`🚀 Direct /bump command detected by ${interaction.user.tag}`);
+        await handleBumpDetection(interaction.channel, interaction.user, null);
     } catch (error) {
-        console.error('Error handling bump command:', error);
+        console.error('Error handling direct bump command:', error);
     }
 }
 
 // Send bump reminder
 async function sendBumpReminder(channel) {
     try {
+        // Check if reminder was already sent for this bump cycle
+        if (bumpData.reminderSent) {
+            console.log('⚠️ Reminder already sent for this bump cycle, skipping...');
+            return;
+        }
+        
         const reminderEmbed = new EmbedBuilder()
             .setColor('#FF6B35')
             .setTitle('🔔 Bump Reminder!')
@@ -124,9 +231,11 @@ async function sendBumpReminder(channel) {
         
         console.log('📢 Bump reminder sent successfully');
         
-        // Reset bump data
+        // Mark reminder as sent and reset bump data
+        bumpData.reminderSent = true;
         bumpData.lastBumpTime = null;
         bumpData.cooldownTimeout = null;
+        bumpData.lastBumpMessageId = null;
         
     } catch (error) {
         console.error('Error sending bump reminder:', error);
